@@ -120,6 +120,7 @@ jobs:
           import android.view.WindowManager
           import android.view.accessibility.AccessibilityEvent
           import android.widget.Button
+          import android.widget.CheckBox
           import android.widget.EditText
           import android.widget.LinearLayout
           import android.widget.RadioButton
@@ -140,6 +141,8 @@ jobs:
               @Volatile var palX0 = 11.6f     // vị trí ngang ô màu đầu tiên (%)
               @Volatile var palDx = 14.8f     // khoảng cách giữa các ô màu (%)
               @Volatile var slots = 5         // số ô màu đầu hàng sẽ thử
+              @Volatile var tapMode = 0       // kiểu chạm 0, 1 hoặc 2 (TEST tự tìm kiểu tô được)
+              @Volatile var noPan = true      // true = chỉ tô trong màn hình đang xem, không tự kéo tranh
 
               val speedMul: Float get() = when (speed) { 0 -> 0.6f; 2 -> 1.7f; else -> 1.0f }
 
@@ -148,13 +151,15 @@ jobs:
                   zoomMode = p.getInt("zoomMode", 0); speed = p.getInt("speed", 1)
                   palY = p.getFloat("palY", 87.3f); palX0 = p.getFloat("palX0", 11.6f); palDx = p.getFloat("palDx", 14.8f)
                   slots = p.getInt("slots", 5)
+                  noPan = p.getBoolean("noPan", true)
+                  tapMode = p.getInt("tapMode", 0)
               }
 
               fun save(c: Context) {
                   c.getSharedPreferences("zen", Context.MODE_PRIVATE).edit()
                       .putInt("zoomMode", zoomMode).putInt("speed", speed)
                       .putFloat("palY", palY).putFloat("palX0", palX0).putFloat("palDx", palDx)
-                      .putInt("slots", slots).apply()
+                      .putInt("slots", slots).putBoolean("noPan", noPan).putInt("tapMode", tapMode).apply()
               }
           }
 
@@ -185,6 +190,11 @@ jobs:
                   bAcc.setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
                   root.addView(bAcc)
 
+                  val cbPan = CheckBox(this)
+                  cbPan.text = "Chỉ tô trong màn hình đang xem, không tự kéo tranh (khuyên dùng để thử)"
+                  cbPan.isChecked = Cfg.noPan
+                  root.addView(cbPan)
+
                   root.addView(label("Zoom tranh"))
                   val zg = RadioGroup(this)
                   listOf("Tự thu nhỏ để thấy cả tranh (khuyên dùng)", "Giữ nguyên zoom hiện tại", "Tự phóng to").forEachIndexed { i, n ->
@@ -214,6 +224,7 @@ jobs:
                   val bSave = Button(this)
                   bSave.text = "LƯU CÀI ĐẶT"
                   bSave.setOnClickListener {
+                      Cfg.noPan = cbPan.isChecked
                       Cfg.zoomMode = (zg.checkedRadioButtonId - 1).coerceIn(0, 2)
                       Cfg.speed = (sg.checkedRadioButtonId - 1).coerceIn(0, 2)
                       Cfg.palY = eY.text.toString().toFloatOrNull() ?: Cfg.palY
@@ -263,9 +274,32 @@ jobs:
                       val b = shot()
                       if (b == null) toast("Không chụp được màn hình (cần Android 11 trở lên)")
                       else {
-                          val f = find(b)
-                          val px = b.getPixel((b.width * Cfg.palX0 / 100f).toInt(), (b.height * Cfg.palY / 100f).toInt())
-                          toast("Thấy ${f.mass} ô caro, ${f.pts.size} điểm sẽ chạm.\nÔ màu đầu hàng: R${px shr 16 and 255} G${px shr 8 and 255} B${px and 255}")
+                          val bd = (getSystemService(WINDOW_SERVICE) as WindowManager).currentWindowMetrics.bounds
+                          val info = "Ảnh chụp ${b.width}x${b.height}, màn hình ${bd.width()}x${bd.height()}."
+                          var cur: Bitmap? = b
+                          var found = -1
+                          var empty = false
+                          var report = ""
+                          for (m in 0..2) {
+                              val bm = cur ?: break
+                              val f = find(bm)
+                              if (f.pts.isEmpty()) { empty = true; break }
+                              val n = minOf(f.pts.size, 6)
+                              for (i in 0 until n) { tap(f.pts[i].x, f.pts[i].y, m); nap(150) }
+                              nap(600)
+                              val b2 = shot()
+                              val after = if (b2 != null) find(b2).mass else -1
+                              report += "Kiểu chạm $m: ô caro ${f.mass} → $after\n"
+                              if (after >= 0 && after < f.mass * 0.97) { found = m; break }
+                              cur = b2
+                          }
+                          val msg: String
+                          if (empty && report.isEmpty()) msg = "$info\nThấy 0 ô caro. Hãy chọn một ô màu ở dưới để hiện vùng caro rồi TEST lại."
+                          else if (found >= 0) {
+                              Cfg.tapMode = found; Cfg.save(this)
+                              msg = "$info\n$report=> Kiểu chạm $found tô được, đã lưu. Bấm START."
+                          } else msg = "$info\n$report=> Cả 3 kiểu chạm đều chưa tô được."
+                          toast(msg); toast(msg)
                       }
                   }.start()
               }
@@ -317,7 +351,11 @@ jobs:
                   latch.await(4, TimeUnit.SECONDS)
               }
 
-              private fun tap(x: Float, y: Float) = gesture(listOf(Path().apply { moveTo(x, y) }), 50)
+              // 3 kiểu chạm: 0 = chạm ngắn, 1 = chạm kèm nhúc nhích nhẹ, 2 = chạm giữ lâu hơn
+              private fun tap(x: Float, y: Float, mode: Int = Cfg.tapMode) {
+                  val p = Path().apply { moveTo(x, y); if (mode == 1) lineTo(x + 2f, y + 2f) }
+                  gesture(listOf(p), when (mode) { 1 -> 120L; 2 -> 220L; else -> 80L })
+              }
 
               // kéo 2 ngón: nội dung dịch (dx*W, dy*H)
               private fun pan(w: Int, h: Int, dx: Float, dy: Float) {
@@ -450,6 +488,7 @@ jobs:
               // quét toàn tranh theo hàng, chạm các vùng caro; trả về số lần chạm
               private fun sweep(g: Int, w: Int, h: Int): Int {
                   var taps = 0; var dirX = -1; var rows = 0
+                  if (Cfg.noPan) return clearView(g)
                   goTopLeft(g, w, h)
                   while (alive(g) && rows < 15) {
                       var cols = 0
@@ -475,7 +514,7 @@ jobs:
                   val first = shot() ?: run { toast("Không chụp được màn hình (cần Android 11+)"); return }
                   val w = first.width; val h = first.height
                   var k = 0; var idle = 0; var level = 0; var round = 0; var painted = 0
-                  when (Cfg.zoomMode) {
+                  when (if (Cfg.noPan) 1 else Cfg.zoomMode) {
                       0 -> { say("■ thu nhỏ tranh…"); zoomOut(g, w, h) }
                       2 -> { say("■ phóng to…"); pinchOut(w, h); nap(500) }
                       else -> {}
@@ -485,7 +524,7 @@ jobs:
                       val b0 = shot() ?: continue
                       val cx = (Cfg.palX0 + Cfg.palDx * k) / 100f * w; val cy = Cfg.palY / 100f * h
                       val c0 = b0.getPixel(cx.toInt(), cy.toInt())
-                      tap(cx, cy); nap(700)
+                      tap(cx, cy, 0); nap(700)
                       say("■ màu ô ${k + 1} · quét…")
                       val n = sweep(g, w, h)
                       painted += n
@@ -494,12 +533,12 @@ jobs:
                       if (n == 0) { idle++; k = (k + 1) % Cfg.slots }
                       else { idle = 0; if (!changed) k = (k + 1) % Cfg.slots }
                       say("■ chạm $painted · vòng $round")
-                      if (Cfg.zoomMode == 0 && idle >= Cfg.slots && level == 0) {
+                      if (!Cfg.noPan && Cfg.zoomMode == 0 && idle >= Cfg.slots && level == 0) {
                           say("■ phóng to…")
                           pinchOut(w, h); Thread.sleep(500)
                           level = 1; idle = 0
                       }
-                      if (idle >= Cfg.slots + 2) { toast("Xong hoặc bị kẹt, dừng."); break }
+                      if (idle >= Cfg.slots + 2) { toast(if (Cfg.noPan) "Hết ô cần tô trong màn hình này. Kéo tranh sang chỗ khác rồi bấm START lại." else "Xong hoặc bị kẹt, dừng."); break }
                   }
               }
           }
