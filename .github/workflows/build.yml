@@ -1,0 +1,515 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Tao project
+        run: |
+          cat > settings.gradle.kts <<'ZENEOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "ZenAuto"
+          ZENEOF
+          cat > build.gradle.kts <<'ZENEOF'
+          plugins {
+              id("com.android.application") version "8.5.2"
+              id("org.jetbrains.kotlin.android") version "1.9.24"
+          }
+
+          android {
+              namespace = "com.zen.auto"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.zen.auto"
+                  minSdk = 30
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          ZENEOF
+          mkdir -p src/main
+          cat > src/main/AndroidManifest.xml <<'ZENEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="Zen Auto"
+                  android:allowBackup="false">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".AutoService"
+                      android:exported="true"
+                      android:label="Zen Auto"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+              </application>
+          </manifest>
+          ZENEOF
+          mkdir -p src/main/res/xml
+          cat > src/main/res/xml/accessibility_config.xml <<'ZENEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:canPerformGestures="true"
+              android:canTakeScreenshot="true"
+              android:description="@string/app_name"
+              android:notificationTimeout="100" />
+          ZENEOF
+          mkdir -p src/main/res/values
+          cat > src/main/res/values/strings.xml <<'ZENEOF'
+          <resources>
+              <string name="app_name">Zen Auto</string>
+          </resources>
+          ZENEOF
+          mkdir -p src/main/java/com/zen/auto
+          cat > src/main/java/com/zen/auto/App.kt <<'ZENEOF'
+          package com.zen.auto
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.app.Activity
+          import android.content.Context
+          import android.content.Intent
+          import android.graphics.Bitmap
+          import android.graphics.Path
+          import android.graphics.PixelFormat
+          import android.graphics.PointF
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.provider.Settings
+          import android.text.InputType
+          import android.util.Log
+          import android.view.Display
+          import android.view.Gravity
+          import android.view.WindowManager
+          import android.view.accessibility.AccessibilityEvent
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.RadioButton
+          import android.widget.RadioGroup
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+          import java.util.concurrent.CountDownLatch
+          import java.util.concurrent.TimeUnit
+          import kotlin.math.abs
+          import kotlin.random.Random
+
+          // Cài đặt lưu trong máy, chỉnh ngay trong app, không cần build lại.
+          object Cfg {
+              @Volatile var zoomMode = 0      // 0 tự thu nhỏ, 1 giữ nguyên zoom, 2 tự phóng to
+              @Volatile var speed = 1         // 0 nhanh, 1 vừa, 2 chậm
+              @Volatile var palY = 87.3f      // vị trí dọc của hàng ô màu (% chiều cao màn hình)
+              @Volatile var palX0 = 11.6f     // vị trí ngang ô màu đầu tiên (%)
+              @Volatile var palDx = 14.8f     // khoảng cách giữa các ô màu (%)
+              @Volatile var slots = 5         // số ô màu đầu hàng sẽ thử
+
+              val speedMul: Float get() = when (speed) { 0 -> 0.6f; 2 -> 1.7f; else -> 1.0f }
+
+              fun load(c: Context) {
+                  val p = c.getSharedPreferences("zen", Context.MODE_PRIVATE)
+                  zoomMode = p.getInt("zoomMode", 0); speed = p.getInt("speed", 1)
+                  palY = p.getFloat("palY", 87.3f); palX0 = p.getFloat("palX0", 11.6f); palDx = p.getFloat("palDx", 14.8f)
+                  slots = p.getInt("slots", 5)
+              }
+
+              fun save(c: Context) {
+                  c.getSharedPreferences("zen", Context.MODE_PRIVATE).edit()
+                      .putInt("zoomMode", zoomMode).putInt("speed", speed)
+                      .putFloat("palY", palY).putFloat("palX0", palX0).putFloat("palDx", palDx)
+                      .putInt("slots", slots).apply()
+              }
+          }
+
+          class MainActivity : Activity() {
+              override fun onCreate(s: Bundle?) {
+                  super.onCreate(s)
+                  Cfg.load(this)
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setPadding(40, 40, 40, 60)
+
+                  fun label(t: String): TextView {
+                      val v = TextView(this); v.text = t; v.textSize = 15f; v.setPadding(0, 28, 0, 8); return v
+                  }
+                  fun field(v: String): EditText {
+                      val e = EditText(this); e.setText(v)
+                      e.inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+                      return e
+                  }
+
+                  root.addView(label(
+                      "CÁCH DÙNG\n" +
+                      "1) Bấm nút bên dưới, bật 'Zen Auto' trong Trợ năng (cài lại app thì phải bật lại).\n" +
+                      "2) Mở Zen Color, vào tranh. Chọn thử 1 màu, bấm nút TEST ở góc dưới phải: nó báo thấy bao nhiêu ô caro.\n" +
+                      "3) Bấm ▶ START. Nút hiện trạng thái: số lần đã chạm, vòng thứ mấy. Bấm lại để dừng."))
+                  val bAcc = Button(this)
+                  bAcc.text = "Mở cài đặt Trợ năng"
+                  bAcc.setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                  root.addView(bAcc)
+
+                  root.addView(label("Zoom tranh"))
+                  val zg = RadioGroup(this)
+                  listOf("Tự thu nhỏ để thấy cả tranh (khuyên dùng)", "Giữ nguyên zoom hiện tại", "Tự phóng to").forEachIndexed { i, n ->
+                      val r = RadioButton(this); r.text = n; r.id = i + 1; zg.addView(r)
+                  }
+                  zg.check(Cfg.zoomMode + 1)
+                  root.addView(zg)
+
+                  root.addView(label("Tốc độ (máy yếu hoặc hay chạm hụt thì chọn Chậm)"))
+                  val sg = RadioGroup(this)
+                  listOf("Nhanh", "Vừa", "Chậm").forEachIndexed { i, n ->
+                      val r = RadioButton(this); r.text = n; r.id = i + 1; sg.addView(r)
+                  }
+                  sg.check(Cfg.speed + 1)
+                  root.addView(sg)
+
+                  root.addView(label("Hàng ô màu ở dưới màn hình (chỉ đổi nếu app bấm trượt ô màu)"))
+                  root.addView(label("Vị trí dọc (%)"))
+                  val eY = field(Cfg.palY.toString()); root.addView(eY)
+                  root.addView(label("Vị trí ngang ô đầu (%)"))
+                  val eX = field(Cfg.palX0.toString()); root.addView(eX)
+                  root.addView(label("Khoảng cách giữa các ô (%)"))
+                  val eD = field(Cfg.palDx.toString()); root.addView(eD)
+                  root.addView(label("Số ô màu đầu hàng sẽ thử (1 đến 6)"))
+                  val eS = field(Cfg.slots.toString()); root.addView(eS)
+
+                  val bSave = Button(this)
+                  bSave.text = "LƯU CÀI ĐẶT"
+                  bSave.setOnClickListener {
+                      Cfg.zoomMode = (zg.checkedRadioButtonId - 1).coerceIn(0, 2)
+                      Cfg.speed = (sg.checkedRadioButtonId - 1).coerceIn(0, 2)
+                      Cfg.palY = eY.text.toString().toFloatOrNull() ?: Cfg.palY
+                      Cfg.palX0 = eX.text.toString().toFloatOrNull() ?: Cfg.palX0
+                      Cfg.palDx = eD.text.toString().toFloatOrNull() ?: Cfg.palDx
+                      Cfg.slots = (eS.text.toString().toIntOrNull() ?: Cfg.slots).coerceIn(1, 6)
+                      Cfg.save(this@MainActivity)
+                      Toast.makeText(this@MainActivity, "Đã lưu", Toast.LENGTH_SHORT).show()
+                  }
+                  root.addView(bSave)
+
+                  val sv = ScrollView(this)
+                  sv.addView(root)
+                  setContentView(sv)
+              }
+          }
+
+          class AutoService : AccessibilityService() {
+              @Volatile private var running = false
+              @Volatile private var gen = 0
+              private lateinit var btn: Button
+              private val ui = Handler(Looper.getMainLooper())
+              private val rnd = Random(System.nanoTime())
+              private val TAG = "ZenAuto"
+
+              override fun onAccessibilityEvent(e: AccessibilityEvent?) {}
+              override fun onInterrupt() {}
+
+              override fun onServiceConnected() {
+                  btn = Button(this).apply { text = "▶ START"; textSize = 12f; setOnClickListener { toggle() } }
+                  val tst = Button(this).apply { text = "TEST"; textSize = 12f; setOnClickListener { test() } }
+                  val box = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; addView(tst); addView(btn) }
+                  val lp = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE, PixelFormat.TRANSLUCENT
+                  ).apply { gravity = Gravity.BOTTOM or Gravity.END; y = 0 }
+                  (getSystemService(WINDOW_SERVICE) as WindowManager).addView(box, lp)
+              }
+
+              private fun nap(ms: Long) { Thread.sleep((ms * Cfg.speedMul).toLong()) }
+
+              // Bấm TEST để kiểm tra nhanh: app thấy bao nhiêu ô caro trên màn hình hiện tại
+              private fun test() {
+                  if (running) { toast("Đang chạy, bấm STOP trước rồi TEST"); return }
+                  Thread {
+                      val b = shot()
+                      if (b == null) toast("Không chụp được màn hình (cần Android 11 trở lên)")
+                      else {
+                          val f = find(b)
+                          val px = b.getPixel((b.width * Cfg.palX0 / 100f).toInt(), (b.height * Cfg.palY / 100f).toInt())
+                          toast("Thấy ${f.mass} ô caro, ${f.pts.size} điểm sẽ chạm.\nÔ màu đầu hàng: R${px shr 16 and 255} G${px shr 8 and 255} B${px and 255}")
+                      }
+                  }.start()
+              }
+
+              private fun toast(s: String) { ui.post { Toast.makeText(this, s, Toast.LENGTH_LONG).show() } }
+              // hiện trạng thái ngay trên nút để biết app đang làm gì
+              private fun say(s: String) { Log.d(TAG, s); ui.post { if (::btn.isInitialized) btn.text = s } }
+              private fun alive(g: Int) = running && gen == g
+
+              private fun toggle() {
+                  if (running) { running = false; gen++; btn.text = "▶ START"; return }
+                  Cfg.load(this)
+                  running = true
+                  btn.text = "■ STOP"
+                  val g = ++gen
+                  Thread {
+                      try { loop(g) }
+                      catch (t: Throwable) { Log.e(TAG, "crash", t); toast("Lỗi: " + t.javaClass.simpleName + " " + t.message) }
+                      finally { if (gen == g) { running = false; ui.post { btn.text = "▶ START" } } }
+                  }.start()
+              }
+
+              // ---------- chụp màn hình / chạm ----------
+              private fun shot(): Bitmap? {
+                  repeat(3) {
+                      Thread.sleep(450)
+                      val latch = CountDownLatch(1); var bmp: Bitmap? = null
+                      takeScreenshot(Display.DEFAULT_DISPLAY, mainExecutor, object : TakeScreenshotCallback {
+                          override fun onSuccess(r: ScreenshotResult) {
+                              bmp = Bitmap.wrapHardwareBuffer(r.hardwareBuffer, r.colorSpace)?.copy(Bitmap.Config.ARGB_8888, false)
+                              r.hardwareBuffer.close(); latch.countDown()
+                          }
+                          override fun onFailure(code: Int) { latch.countDown() }
+                      })
+                      latch.await(3, TimeUnit.SECONDS)
+                      if (bmp != null) return bmp
+                  }
+                  return null
+              }
+
+              private fun gesture(paths: List<Path>, dur: Long) {
+                  val b = GestureDescription.Builder()
+                  paths.forEach { b.addStroke(GestureDescription.StrokeDescription(it, 0, dur)) }
+                  val latch = CountDownLatch(1)
+                  dispatchGesture(b.build(), object : GestureResultCallback() {
+                      override fun onCompleted(g: GestureDescription?) { latch.countDown() }
+                      override fun onCancelled(g: GestureDescription?) { latch.countDown() }
+                  }, null)
+                  latch.await(4, TimeUnit.SECONDS)
+              }
+
+              private fun tap(x: Float, y: Float) = gesture(listOf(Path().apply { moveTo(x, y) }), 50)
+
+              // kéo 2 ngón: nội dung dịch (dx*W, dy*H)
+              private fun pan(w: Int, h: Int, dx: Float, dy: Float) {
+                  val sx = 0.5f * w - dx * w / 2; val sy = 0.48f * h - dy * h / 2
+                  val ex = sx + dx * w; val ey = sy + dy * h
+                  val off = 0.06f * w
+                  gesture(listOf(
+                      Path().apply { moveTo(sx - off, sy); lineTo(ex - off, ey) },
+                      Path().apply { moveTo(sx + off, sy); lineTo(ex + off, ey) }), 450)
+                  nap(250)
+              }
+
+              // chụm 2 ngón = thu nhỏ; giãn 2 ngón = phóng to
+              private fun pinchIn(w: Int, h: Int) {
+                  val y = 0.48f * h
+                  gesture(listOf(
+                      Path().apply { moveTo(0.12f * w, y); lineTo(0.42f * w, y) },
+                      Path().apply { moveTo(0.88f * w, y); lineTo(0.58f * w, y) }), 500)
+              }
+              private fun pinchOut(w: Int, h: Int) {
+                  val y = 0.48f * h
+                  gesture(listOf(
+                      Path().apply { moveTo(0.40f * w, y); lineTo(0.25f * w, y) },
+                      Path().apply { moveTo(0.60f * w, y); lineTo(0.75f * w, y) }), 500)
+              }
+
+              // ---------- nhận diện ----------
+              private class Found(val pts: List<PointF>, val mass: Int)
+
+              // Vùng caro (ô xám xanh ~187,186,191) = các ô cần tô của màu đang chọn.
+              // Mỗi cụm trả về NHIỀU điểm chạm rải đều (cụm có thể gồm nhiều vùng sát nhau),
+              // 'mass' = tổng số ô caro để biết sau khi chạm có giảm không.
+              private fun find(b: Bitmap): Found {
+                  val w = b.width; val h = b.height; val y0 = (0.13f * h).toInt(); val cs = 12
+                  val gw = w / cs; val gh = (0.70f * h).toInt() / cs
+                  val cnt = IntArray(gw * gh); val row = IntArray(w)
+                  for (gy in 0 until gh) for (yy in 0 until cs) {
+                      b.getPixels(row, 0, w, 0, y0 + gy * cs + yy, w, 1)
+                      for (x in 0 until gw * cs) {
+                          val c = row[x]; val r = c shr 16 and 255; val g = c shr 8 and 255; val bl = c and 255
+                          if (r in 178..196 && abs(r - g) <= 3 && bl - r in 2..9) cnt[gy * gw + x / cs]++
+                      }
+                  }
+                  val seen = BooleanArray(gw * gh); val out = ArrayList<PointF>(); var mass = 0
+                  for (s in cnt.indices) {
+                      if (cnt[s] < 12 || seen[s]) continue
+                      val comp = ArrayList<Int>(); val q = ArrayDeque<Int>(); q.add(s); seen[s] = true
+                      while (q.isNotEmpty()) {
+                          val c = q.removeFirst(); comp.add(c)
+                          for (dy in -2..2) for (dx in -2..2) {
+                              val nx = c % gw + dx; val ny = c / gw + dy
+                              if (nx < 0 || ny < 0 || nx >= gw || ny >= gh) continue
+                              val n = ny * gw + nx
+                              if (!seen[n] && cnt[n] >= 12) { seen[n] = true; q.add(n) }
+                          }
+                      }
+                      mass += comp.size
+                      comp.shuffle(rnd)
+                      val picks = ArrayList<Int>()
+                      for (c in comp) {
+                          if (picks.size >= 14) break
+                          var ok = true
+                          for (p in picks) if (abs(p % gw - c % gw) < 5 && abs(p / gw - c / gw) < 5) { ok = false; break }
+                          if (ok) picks.add(c)
+                      }
+                      for (c in picks) out.add(PointF((c % gw * cs + cs / 2).toFloat(), (y0 + c / gw * cs + cs / 2).toFloat()))
+                  }
+                  return Found(if (out.size > 40) out.subList(0, 40) else out, mass)
+              }
+
+              // 2 ảnh giống nhau = không kéo được nữa (chạm mép tranh).
+              // Chỉ so các điểm TỐI (nét vẽ / số / màu đã tô) của ảnh a: nếu vẫn tối y như cũ ở ảnh b thì "không dịch".
+              // Vùng trắng trống không được tính (bản cũ tính cả vùng trắng nên hay báo nhầm "chạm mép").
+              private fun same(a: Bitmap, b: Bitmap): Boolean {
+                  var dark = 0; var kept = 0; val n = 70
+                  for (i in 1..n) for (j in 1..n) {
+                      val x = a.width * i / (n + 1); val y = (a.height * (0.15f + 0.68f * j / (n + 1))).toInt()
+                      val pa = a.getPixel(x, y)
+                      val ra = pa shr 16 and 255; val ga = pa shr 8 and 255; val ba = pa and 255
+                      if (ra + ga + ba < 600) {
+                          dark++
+                          val pb = b.getPixel(x, y)
+                          val d = abs(ra - (pb shr 16 and 255)) + abs(ga - (pb shr 8 and 255)) + abs(ba - (pb and 255))
+                          if (d < 30) kept++
+                      }
+                  }
+                  if (dark < 25) return false          // quá ít chi tiết để kết luận -> coi như đã dịch
+                  return kept >= dark * 0.93
+              }
+
+              private fun close(a: Int, b: Int) =
+                  abs((a shr 16 and 255) - (b shr 16 and 255)) + abs((a shr 8 and 255) - (b shr 8 and 255)) + abs((a and 255) - (b and 255)) < 20
+
+              // chạm hết các vùng caro đang thấy; trả về số lần chạm
+              private fun clearView(g: Int): Int {
+                  var total = 0; var lastMass = Int.MAX_VALUE
+                  repeat(8) {
+                      if (!alive(g)) return total
+                      val bm = shot() ?: return total
+                      val f = find(bm)
+                      if (f.pts.isEmpty() || f.mass >= lastMass * 0.97) return total
+                      lastMass = f.mass
+                      for (p in f.pts) { if (!alive(g)) return total; tap(p.x, p.y); nap(120) }
+                      total += f.pts.size
+                      nap(300)
+                  }
+                  return total
+              }
+
+              private fun zoomOut(g: Int, w: Int, h: Int) {
+                  repeat(4) {
+                      if (!alive(g)) return
+                      val a = shot() ?: return
+                      pinchIn(w, h); Thread.sleep(400)
+                      val b = shot() ?: return
+                      if (same(a, b)) return
+                  }
+              }
+
+              private fun goTopLeft(g: Int, w: Int, h: Int) {
+                  repeat(12) {
+                      if (!alive(g)) return
+                      val a = shot() ?: return
+                      pan(w, h, 0.7f, 0.4f)
+                      val b = shot() ?: return
+                      if (same(a, b)) return
+                  }
+              }
+
+              // quét toàn tranh theo hàng, chạm các vùng caro; trả về số lần chạm
+              private fun sweep(g: Int, w: Int, h: Int): Int {
+                  var taps = 0; var dirX = -1; var rows = 0
+                  goTopLeft(g, w, h)
+                  while (alive(g) && rows < 15) {
+                      var cols = 0
+                      while (alive(g) && cols < 12) {
+                          taps += clearView(g)
+                          val a = shot() ?: return taps
+                          pan(w, h, dirX * 0.6f, 0f)
+                          val b = shot() ?: return taps
+                          if (same(a, b)) break
+                          cols++
+                      }
+                      val a = shot() ?: return taps
+                      pan(w, h, 0f, -0.4f)
+                      val b = shot() ?: return taps
+                      if (same(a, b)) break
+                      dirX = -dirX; rows++
+                  }
+                  return taps
+              }
+
+              // ---------- vòng lặp chính ----------
+              private fun loop(g: Int) {
+                  val first = shot() ?: run { toast("Không chụp được màn hình (cần Android 11+)"); return }
+                  val w = first.width; val h = first.height
+                  var k = 0; var idle = 0; var level = 0; var round = 0; var painted = 0
+                  when (Cfg.zoomMode) {
+                      0 -> { say("■ thu nhỏ tranh…"); zoomOut(g, w, h) }
+                      2 -> { say("■ phóng to…"); pinchOut(w, h); nap(500) }
+                      else -> {}
+                  }
+                  while (alive(g)) {
+                      round++
+                      val b0 = shot() ?: continue
+                      val cx = (Cfg.palX0 + Cfg.palDx * k) / 100f * w; val cy = Cfg.palY / 100f * h
+                      val c0 = b0.getPixel(cx.toInt(), cy.toInt())
+                      tap(cx, cy); nap(700)
+                      say("■ màu ô ${k + 1} · quét…")
+                      val n = sweep(g, w, h)
+                      painted += n
+                      val b1 = shot() ?: continue
+                      val changed = !close(c0, b1.getPixel(cx.toInt(), cy.toInt()))
+                      if (n == 0) { idle++; k = (k + 1) % Cfg.slots }
+                      else { idle = 0; if (!changed) k = (k + 1) % Cfg.slots }
+                      say("■ chạm $painted · vòng $round")
+                      if (Cfg.zoomMode == 0 && idle >= Cfg.slots && level == 0) {
+                          say("■ phóng to…")
+                          pinchOut(w, h); Thread.sleep(500)
+                          level = 1; idle = 0
+                      }
+                      if (idle >= Cfg.slots + 2) { toast("Xong hoặc bị kẹt, dừng."); break }
+                  }
+              }
+          }
+          ZENEOF
+
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: 8.7
+      - run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ZenAuto-apk
+          path: build/outputs/apk/debug/*.apk
