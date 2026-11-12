@@ -142,24 +142,24 @@ jobs:
               @Volatile var palDx = 14.8f     // khoảng cách giữa các ô màu (%)
               @Volatile var slots = 5         // số ô màu đầu hàng sẽ thử
               @Volatile var tapMode = 0       // kiểu chạm 0, 1 hoặc 2 (TEST tự tìm kiểu tô được)
-              @Volatile var noPan = true      // true = chỉ tô trong màn hình đang xem, không tự kéo tranh
+              @Volatile var noPan = false     // true = chỉ tô trong màn hình đang xem, không tự kéo/zoom tranh
 
               val speedMul: Float get() = when (speed) { 0 -> 0.6f; 2 -> 1.7f; else -> 1.0f }
 
               fun load(c: Context) {
                   val p = c.getSharedPreferences("zen", Context.MODE_PRIVATE)
-                  zoomMode = p.getInt("zoomMode", 0); speed = p.getInt("speed", 1)
+                  zoomMode = p.getInt("zoomMode2", 0); speed = p.getInt("speed", 1)
                   palY = p.getFloat("palY", 87.3f); palX0 = p.getFloat("palX0", 11.6f); palDx = p.getFloat("palDx", 14.8f)
                   slots = p.getInt("slots", 5)
-                  noPan = p.getBoolean("noPan", true)
+                  noPan = p.getBoolean("noPan2", false)
                   tapMode = p.getInt("tapMode", 0)
               }
 
               fun save(c: Context) {
                   c.getSharedPreferences("zen", Context.MODE_PRIVATE).edit()
-                      .putInt("zoomMode", zoomMode).putInt("speed", speed)
+                      .putInt("zoomMode2", zoomMode).putInt("speed", speed)
                       .putFloat("palY", palY).putFloat("palX0", palX0).putFloat("palDx", palDx)
-                      .putInt("slots", slots).putBoolean("noPan", noPan).putInt("tapMode", tapMode).apply()
+                      .putInt("slots", slots).putBoolean("noPan2", noPan).putInt("tapMode", tapMode).apply()
               }
           }
 
@@ -191,7 +191,7 @@ jobs:
                   root.addView(bAcc)
 
                   val cbPan = CheckBox(this)
-                  cbPan.text = "Chỉ tô trong màn hình đang xem, không tự kéo tranh (khuyên dùng để thử)"
+                  cbPan.text = "Chỉ tô trong màn hình đang xem, không tự kéo/zoom tranh (chỉ để thử)"
                   cbPan.isChecked = Cfg.noPan
                   root.addView(cbPan)
 
@@ -249,6 +249,7 @@ jobs:
               private val ui = Handler(Looper.getMainLooper())
               private val rnd = Random(System.nanoTime())
               private val TAG = "ZenAuto"
+              @Volatile private var seenMax = 0
 
               override fun onAccessibilityEvent(e: AccessibilityEvent?) {}
               override fun onInterrupt() {}
@@ -386,44 +387,50 @@ jobs:
               private class Found(val pts: List<PointF>, val mass: Int)
 
               // Vùng caro (ô xám xanh ~187,186,191) = các ô cần tô của màu đang chọn.
-              // Mỗi cụm trả về NHIỀU điểm chạm rải đều (cụm có thể gồm nhiều vùng sát nhau),
-              // 'mass' = tổng số ô caro để biết sau khi chạm có giảm không.
+              // Thử lưới thô trước (tranh phóng to); không thấy thì thử lưới mịn (tranh thu nhỏ, ô caro rất bé).
               private fun find(b: Bitmap): Found {
-                  val w = b.width; val h = b.height; val y0 = (0.13f * h).toInt(); val cs = 12
+                  val f = findWith(b, 12, 12, 178, 196, 2, 5, 14, 40, 1)
+                  if (f.pts.isNotEmpty()) return f
+                  return findWith(b, 4, 5, 170, 238, 3, 4, 10, 60, 8)
+              }
+
+              private fun findWith(b: Bitmap, cs: Int, thr: Int, lo: Int, hi: Int, nb: Int, gap: Int, cap: Int, tot: Int, minComp: Int): Found {
+                  val w = b.width; val h = b.height; val y0 = (0.13f * h).toInt()
                   val gw = w / cs; val gh = (0.70f * h).toInt() / cs
                   val cnt = IntArray(gw * gh); val row = IntArray(w)
                   for (gy in 0 until gh) for (yy in 0 until cs) {
                       b.getPixels(row, 0, w, 0, y0 + gy * cs + yy, w, 1)
                       for (x in 0 until gw * cs) {
                           val c = row[x]; val r = c shr 16 and 255; val g = c shr 8 and 255; val bl = c and 255
-                          if (r in 178..196 && abs(r - g) <= 3 && bl - r in 2..9) cnt[gy * gw + x / cs]++
+                          if (r in lo..hi && abs(r - g) <= 3 && bl - r in 2..9) cnt[gy * gw + x / cs]++
                       }
                   }
-                  val seen = BooleanArray(gw * gh); val out = ArrayList<PointF>(); var mass = 0
+                  val seenCell = BooleanArray(gw * gh); val out = ArrayList<PointF>(); var mass = 0
                   for (s in cnt.indices) {
-                      if (cnt[s] < 12 || seen[s]) continue
-                      val comp = ArrayList<Int>(); val q = ArrayDeque<Int>(); q.add(s); seen[s] = true
+                      if (cnt[s] < thr || seenCell[s]) continue
+                      val comp = ArrayList<Int>(); val q = ArrayDeque<Int>(); q.add(s); seenCell[s] = true
                       while (q.isNotEmpty()) {
                           val c = q.removeFirst(); comp.add(c)
-                          for (dy in -2..2) for (dx in -2..2) {
+                          for (dy in -nb..nb) for (dx in -nb..nb) {
                               val nx = c % gw + dx; val ny = c / gw + dy
                               if (nx < 0 || ny < 0 || nx >= gw || ny >= gh) continue
                               val n = ny * gw + nx
-                              if (!seen[n] && cnt[n] >= 12) { seen[n] = true; q.add(n) }
+                              if (!seenCell[n] && cnt[n] >= thr) { seenCell[n] = true; q.add(n) }
                           }
                       }
+                      if (comp.size < minComp) continue   // bỏ nhiễu nhỏ (nét vẽ bị làm mịn)
                       mass += comp.size
                       comp.shuffle(rnd)
                       val picks = ArrayList<Int>()
                       for (c in comp) {
-                          if (picks.size >= 14) break
+                          if (picks.size >= cap) break
                           var ok = true
-                          for (p in picks) if (abs(p % gw - c % gw) < 5 && abs(p / gw - c / gw) < 5) { ok = false; break }
+                          for (p in picks) if (abs(p % gw - c % gw) < gap && abs(p / gw - c / gw) < gap) { ok = false; break }
                           if (ok) picks.add(c)
                       }
                       for (c in picks) out.add(PointF((c % gw * cs + cs / 2).toFloat(), (y0 + c / gw * cs + cs / 2).toFloat()))
                   }
-                  return Found(if (out.size > 40) out.subList(0, 40) else out, mass)
+                  return Found(if (out.size > tot) out.subList(0, tot) else out, mass)
               }
 
               // 2 ảnh giống nhau = không kéo được nữa (chạm mép tranh).
@@ -451,12 +458,17 @@ jobs:
 
               // chạm hết các vùng caro đang thấy; trả về số lần chạm
               private fun clearView(g: Int): Int {
-                  var total = 0; var lastMass = Int.MAX_VALUE
+                  var total = 0; var lastMass = Int.MAX_VALUE; var tries = 0
                   repeat(8) {
                       if (!alive(g)) return total
                       val bm = shot() ?: return total
                       val f = find(bm)
-                      if (f.pts.isEmpty() || f.mass >= lastMass * 0.97) return total
+                      if (f.mass > seenMax) seenMax = f.mass
+                      if (f.pts.isEmpty()) return total
+                      if (f.mass >= lastMass * 0.97) {
+                          // đã chạm mà vùng caro vẫn còn nhiều: đổi sang kiểu chạm khác
+                          if (tries < 2 && f.mass >= 15) { tries++; Cfg.tapMode = (Cfg.tapMode + 1) % 3 } else return total
+                      }
                       lastMass = f.mass
                       for (p in f.pts) { if (!alive(g)) return total; tap(p.x, p.y); nap(120) }
                       total += f.pts.size
@@ -526,17 +538,18 @@ jobs:
                       val c0 = b0.getPixel(cx.toInt(), cy.toInt())
                       tap(cx, cy, 0); nap(700)
                       say("■ màu ô ${k + 1} · quét…")
+                      seenMax = 0
                       val n = sweep(g, w, h)
                       painted += n
                       val b1 = shot() ?: continue
                       val changed = !close(c0, b1.getPixel(cx.toInt(), cy.toInt()))
                       if (n == 0) { idle++; k = (k + 1) % Cfg.slots }
                       else { idle = 0; if (!changed) k = (k + 1) % Cfg.slots }
-                      say("■ chạm $painted · vòng $round")
-                      if (!Cfg.noPan && Cfg.zoomMode == 0 && idle >= Cfg.slots && level == 0) {
+                      say("■ chạm $painted · vòng $round · thấy $seenMax")
+                      if (!Cfg.noPan && Cfg.zoomMode == 0 && idle >= Cfg.slots && level < 2) {
                           say("■ phóng to…")
                           pinchOut(w, h); Thread.sleep(500)
-                          level = 1; idle = 0
+                          level++; idle = 0
                       }
                       if (idle >= Cfg.slots + 2) { toast(if (Cfg.noPan) "Hết ô cần tô trong màn hình này. Kéo tranh sang chỗ khác rồi bấm START lại." else "Xong hoặc bị kẹt, dừng."); break }
                   }
